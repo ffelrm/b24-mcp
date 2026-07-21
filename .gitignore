@@ -1,0 +1,16 @@
+# Секреты — реальный конфиг никогда не коммитим
+.env
+.env.*
+!.env.example
+
+# Окружение и сборка
+.venv/
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.py[cod]
+
+.DS_Store
+*.log
+.pytest_cache/
