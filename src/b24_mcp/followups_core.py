@@ -1,7 +1,7 @@
 """Клиент к методам AI Follow-up звонков: call.followup.list / call.followup.get.
 
 Это методы REST **v3** (путь /rest/api/...), не v1. Ключевой нюанс URL, выясненный
-эмпирически 2026-06-17 на портале Льва:
+эмпирически 2026-06-17 на облачном портале:
 
   Вебхук РАБОТАЕТ с v3, если префикс `api/` стоит ПЕРЕД uid/token:
       POST <portal>/rest/api/<uid>/<token>/call.followup.<method>   ✅
