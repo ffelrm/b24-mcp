@@ -14,9 +14,10 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urljoin
 
 from . import normalizers as nz
-from .client import Client
+from .client import B24Error, Client
 
 # ---------------------------------------------------------------- люди
 
@@ -146,6 +147,129 @@ def calendar_events(
     return nz.page(out, limit=len(out))
 
 
+# ---------------------------------------------------------------- согласования
+
+
+def approvals(client: Client) -> list[dict[str, Any]]:
+    """Незавершённые задания согласования владельца вебхука (STATUS 0 — ждёт решения).
+
+    Только чтение: решение по заданию сервер не принимает. `url` — абсолютная
+    ссылка на документ: портал отдаёт DOCUMENT_URL относительным, приклеиваем
+    базу портала из вебхука (без токена).
+    """
+    if client.user_id is None:
+        raise B24Error(
+            "bizproc.task.list", "USER_ID_REQUIRED",
+            "не указан B24_USER_ID: задания читаются по id владельца вебхука",
+        )
+    base = (getattr(client, "portal", "") or "").rstrip("/") + "/"
+    fields = ["ID", "NAME", "DOCUMENT_NAME", "DOCUMENT_URL", "MODIFIED"]
+    return [
+        {**item, "url": urljoin(base, item.get("DOCUMENT_URL") or "")}
+        for item in client.call_list("bizproc.task.list", {
+            "filter": {"USER_ID": client.user_id, "STATUS": 0}, "select": fields,
+        })
+    ]
+
+
+# ---------------------------------------------------------------- группы и канбан
+
+
+def group_get(client: Client, group_id: int) -> dict[str, Any]:
+    """Карточка группы: sonet_group.get возвращает список UPPER_CASE карточек."""
+    cards = client.call("sonet_group.get", {"FILTER": {"ID": int(group_id)}})
+    if not cards:
+        raise B24Error("sonet_group.get", "NOT_FOUND", "группа не найдена или нет доступа")
+    card = cards[0]
+    result = {
+        "id": int(card["ID"]),
+        "name": card.get("NAME") or "",
+        "owner_id": int(card.get("OWNER_ID") or 0),
+        "is_project": nz.is_yes(card.get("PROJECT")),
+        "closed": nz.is_yes(card.get("CLOSED")),
+        "visible": nz.is_yes(card.get("VISIBLE")),
+        "opened": nz.is_yes(card.get("OPENED")),
+    }
+    if result["owner_id"]:
+        try:
+            res = client.call("user.get", {"ID": result["owner_id"]})
+        except B24Error:
+            # Имя — необязательное дополнение: карточка группы уже получена.
+            res = None
+        owner = res[0] if isinstance(res, list) and res else {}
+        name = " ".join(filter(None, [owner.get("LAST_NAME"), owner.get("NAME")])).strip()
+        if name:
+            result["owner_name"] = name
+    return result
+
+
+def group_stages(client: Client, group_id: int) -> list[dict[str, Any]]:
+    """Колонки канбана в порядке SORT; портал отдаёт dict по строковому ID."""
+    raw = client.call("task.stages.get", {"entityId": int(group_id)}) or {}
+    entries = raw.items() if isinstance(raw, dict) else ((None, row) for row in raw)
+    stages = []
+    for key, row in entries:
+        stage = {
+            "id": int(row.get("ID") or key),
+            "title": row.get("TITLE") or "",
+            "sort": int(row.get("SORT") or 0),
+            "is_new": row.get("SYSTEM_TYPE") == "NEW",
+        }
+        if "COLOR" in row:
+            stage["color"] = row["COLOR"]
+        stages.append(stage)
+    return sorted(stages, key=lambda s: (s["sort"], s["id"]))
+
+
+def stage_for_id(stages: list[dict[str, Any]], stage_id: Any) -> dict[str, Any] | None:
+    """Ноль означает NEW-колонку; отсутствующий ID не является нулём."""
+    if stage_id is None or stage_id == "":
+        return None
+    try:
+        sid = int(stage_id)
+    except (TypeError, ValueError):
+        return None
+    return next((s for s in stages if (s["is_new"] if sid == 0 else s["id"] == sid)), None)
+
+
+def group_tasks(
+    client: Client, group_id: int, *, user_id: int | None = None,
+    include_done: bool = False, limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Все задачи группы, без неявного фильтра владельца хука.
+
+    STATUS — виртуальный мета-статус: серверу передаём только REAL_STATUS.
+    Лимит применяем к принятым строкам, не вытягивая следующую страницу.
+    """
+    if int(limit) < 1:
+        raise ValueError("limit должен быть положительным")
+    flt: dict[str, Any] = {"GROUP_ID": int(group_id)}
+    if user_id is not None:
+        flt["RESPONSIBLE_ID"] = int(user_id)
+    if not include_done:
+        flt["!REAL_STATUS"] = 5
+    rows = []
+    for task in client.call_list("tasks.task.list", {
+        "filter": flt,
+        "select": ["ID", "TITLE", "STATUS", "DEADLINE", "RESPONSIBLE_ID",
+                   "CREATED_DATE", "GROUP_ID", "PRIORITY", "STAGE_ID", "CLOSED_DATE", "CREATED_BY"],
+        "order": {"ID": "desc"},
+    }):
+        if not include_done and str(task.get("status")) == "5":
+            continue
+        rows.append(dict(task, stageName=""))
+        if len(rows) >= int(limit):
+            break
+    # task.stages.get создаёт стадии на доске без них: запрашиваем их только
+    # при наличии ненулевого stageId среди уже отобранных задач.
+    if any(task.get("stageId") not in (None, "", 0, "0") for task in rows):
+        stages = group_stages(client, group_id)
+        for task in rows:
+            stage = stage_for_id(stages, task.get("stageId"))
+            task["stageName"] = stage["title"] if stage else ""
+    return rows
+
+
 # ---------------------------------------------------------------- задачи
 
 _ROLE_FILTER = {
@@ -161,16 +285,22 @@ def tasks_list(
     client: Client,
     *,
     user_id: int | None = None,
+    group_id: int | None = None,
     role: str = "responsible",
     include_done: bool = False,
     limit: Any = 50,
 ) -> dict[str, Any]:
-    """Задачи человека в выбранной роли.
+    """Задачи человека в выбранной роли или все задачи группы.
 
     Дефолт `responsible` = «висит лично на исполнителе» — правильный ответ на
     вопрос «что на нём». У руководителя почти все видимые задачи чужие (он
     постановщик/наблюдатель), поэтому без фильтра роли список бесполезен.
+
+    С `group_id` — все задачи группы без неявного фильтра владельца хука;
+    `user_id` тогда сужает список по ответственному, роль — только responsible.
     """
+    if group_id is not None and role != "responsible":
+        raise B24Error("tasks.task.list", "INVALID_ARGUMENT", "с group_id разрешена только роль responsible")
     uid = int(user_id) if user_id else (client.user_id or 0)
     lim = nz.clamp(limit, default=50)
     key = _ROLE_FILTER.get((role or "").lower(), "RESPONSIBLE_ID")
@@ -178,22 +308,30 @@ def tasks_list(
     if not include_done:
         flt["<REAL_STATUS"] = 5  # 5 = завершена
     rows: list[dict[str, Any]] = []
-    for t in client.call_list(
-        "tasks.task.list",
-        {
-            "filter": flt,
-            "select": [
-                "ID", "TITLE", "STATUS", "DEADLINE", "RESPONSIBLE_ID",
-                "CREATED_BY", "GROUP_ID", "ACTIVITY_DATE",
-            ],
-            "order": {"ACTIVITY_DATE": "desc"},
-        },
-    ):
+    if group_id is not None:
+        source = group_tasks(client, group_id, user_id=user_id, include_done=include_done, limit=lim)
+    else:
+        source = client.call_list(
+            "tasks.task.list",
+            {
+                "filter": flt,
+                "select": [
+                    "ID", "TITLE", "STATUS", "DEADLINE", "RESPONSIBLE_ID",
+                    "CREATED_BY", "GROUP_ID", "ACTIVITY_DATE", "PRIORITY", "STAGE_ID", "CLOSED_DATE",
+                ],
+                "order": {"ACTIVITY_DATE": "desc"},
+            },
+        )
+    for t in source:
         rows.append(
             {
                 "id": int(t["id"]) if str(t.get("id", "")).isdigit() else t.get("id"),
                 "title": nz.clean_text(t.get("title")),
                 "status": t.get("status"),
+                "priority": t.get("priority"),
+                "stage_id": t.get("stageId"),
+                "closed_date": t.get("closedDate") or None,
+                **({"stage_name": t.get("stageName")} if group_id is not None else {}),
                 "deadline": t.get("deadline") or None,
                 "responsible_id": t.get("responsibleId"),
                 "created_by": t.get("createdBy"),
@@ -477,29 +615,45 @@ def project_read(
 
 
 def followups_list(
-    client: Client, *, days: Any = 7, user_id: int | None = None, max_items: Any = 20
+    client: Client,
+    *,
+    days: Any = 7,
+    user_id: int | None = None,
+    max_items: Any = 20,
+    source: str = "all",
 ) -> dict[str, Any]:
-    """Завершённые звонки с ГОТОВЫМ AI-разбором за окно.
+    """Завершённые звонки с ГОТОВЫМ AI-разбором за окно: звонки Б24 и встречи Синка.
 
     Звонки без разбора портал не отдаёт — пустой список это норма, а не сбой.
-    Фильтр по участнику работает только под админскими правами.
+    Фильтр по участнику работает только для звонков Б24 и под админскими правами.
+    Источники опрашиваются независимо; отказ одного — в `sources`, а не исключение.
     """
     from . import config as _config
-    from .followups_core import DEFAULT_LIST_SELECT, FollowUpsClient
+    from .followups_core import ALL_SOURCES, SOURCES, collect
 
     n = nz.clamp(days, lo=1, hi=90, default=7)
     cap = nz.clamp(max_items, hi=100, default=20)
     d_to = date.today()
     d_from = d_to - timedelta(days=n - 1)
-    fc = FollowUpsClient(_config.load())
+    if source not in ("all", *SOURCES):
+        raise ValueError(f"source: all | {' | '.join(SOURCES)}")
+    sources = ALL_SOURCES if source == "all" else (source,)
+    items, errors = collect(
+        _config.load(), d_from, d_to, sources=sources, participant_id=user_id, max_items=cap
+    )
+    if len(errors) == len(sources):
+        # Не ответил ни один источник — это ошибка, а не «звонков не было».
+        raise next(iter(errors.values()))
     rows = []
-    for it in fc.list(
-        d_from, d_to, select=DEFAULT_LIST_SELECT, participant_id=user_id, max_items=cap
-    ):
+    for it in items:
         ov = it.get("overview") or {}
         rows.append(
             {
                 "call_id": it.get("callId"),
+                # Откуда звонок: id Синка и id звонка Б24 — разные нумерации,
+                # followup_get без этого поля найдёт чужой звонок.
+                "source": it.get("source"),
+                "chat_id": it.get("chatId"),
                 "started": it.get("startDate"),
                 "duration_sec": it.get("durationSeconds"),
                 "call_type": it.get("callType"),
@@ -515,13 +669,21 @@ def followups_list(
                 "action_items_count": len(ov.get("actionItems") or []),
             }
         )
-    return {"window_days": n, "since": d_from.isoformat(), **nz.page(rows, limit=cap)}
+    status = {src: ("ok" if src not in errors else str(errors[src])) for src in sources}
+    return {
+        "window_days": n,
+        "since": d_from.isoformat(),
+        "sources": status,
+        **nz.page(rows, limit=cap),
+    }
 
 
 def followup_get(
-    client: Client, call_id: int, *, transcript: bool = False
+    client: Client, call_id: int, *, transcript: bool = False, source: str = "call"
 ) -> dict[str, Any]:
     """Разбор одного звонка: обзор, договорённости, action items, участники.
+
+    `source` — из строки followups_list: "call" (звонок Б24) или "sync" (Синк).
 
     `transcript=True` добавляет полную расшифровку — она тяжёлая, бери её
     только когда нужна атрибуция реплик или точная цитата.
@@ -532,11 +694,13 @@ def followup_get(
     from . import config as _config
     from .followups_core import FollowUpsClient
 
-    fc = FollowUpsClient(_config.load())
+    fc = FollowUpsClient(_config.load(), source=source)
     item = fc.get(int(call_id)) or {}
     ov = item.get("overview") or {}
     out: dict[str, Any] = {
         "call_id": item.get("callId") or int(call_id),
+        "source": source,
+        "chat_id": item.get("chatId"),
         "started": item.get("startDate"),
         "duration_sec": item.get("durationSeconds"),
         "topic": nz.clean_text(ov.get("topic")),

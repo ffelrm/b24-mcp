@@ -18,19 +18,21 @@
 одного tool-call: там лимит времени и негде держать чекпоинт. CLI с
 чекпоинтами переживает обрыв, MCP — нет.
 
-Запуск: .venv-mcp/bin/python mcp_server.py
-Зависимости (mcp SDK, pydantic) живут в .venv-mcp; ядро b24_mcp остаётся
-stdlib-only и продолжает работать без них.
+Запуск: `python -m b24_mcp.server` после `pip install -e .` (см. README).
+Зависимости (mcp SDK, pydantic) нужны только серверу; ядро b24_mcp остаётся
+stdlib-only.
 """
 from __future__ import annotations
 
 import functools
 import inspect
 import logging
+import re
 import sys
 import time
+import traceback
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -67,11 +69,20 @@ def _client() -> Client:
     return Client(cfg, allow_write=False)
 
 
+def _redact(s: str) -> str:
+    """Скрыть токены вебхука и OAuth в ответах и диагностике ошибок."""
+    s = re.sub(r"(/rest/(?:api/)?\d+/)[^/\s'\"]+", r"\1<redacted>", s)
+    return re.sub(
+        r"(\b(?:auth|access_token|refresh_token)=)[^&\s'\"#]+",
+        r"\1<redacted>", s,
+    )
+
+
 def b24_tool(fn):
     """Регистрация инструмента + лог вызова с таймингом.
 
     В лог идут имя, аргументы, длительность и код ошибки Битрикса. Вебхук и
-    токен не логируются никогда — их просто нет в этих значениях.
+    токен скрываются в текстах ошибок, включая traceback.
     """
 
     @functools.wraps(fn)
@@ -83,22 +94,26 @@ def b24_tool(fn):
         except B24Error as e:  # структурная ошибка портала — отдаём код как есть
             logger.warning(
                 "tool.b24_error %s code=%s elapsed_ms=%d",
-                fn.__name__, e.code, int((time.monotonic() - started) * 1000),
+                fn.__name__, _redact(str(e.code)), int((time.monotonic() - started) * 1000),
             )
-            raise RuntimeError(f"Битрикс24 ответил ошибкой {e.code}: {e}") from None
+            raise RuntimeError(_redact(f"Битрикс24 ответил ошибкой {e.code}: {e}")) from None
         except Exception as e:
-            logger.exception(
-                "tool.error %s elapsed_ms=%d", fn.__name__,
+            logger.error(
+                "tool.error %s elapsed_ms=%d\n%s", fn.__name__,
                 int((time.monotonic() - started) * 1000),
+                _redact("".join(traceback.format_exception(type(e), e, e.__traceback__))),
             )
-            raise RuntimeError(f"{fn.__name__}: {e}") from None
+            raise RuntimeError(_redact(f"{fn.__name__}: {e}")) from None
         logger.info(
             "tool.done %s elapsed_ms=%d", fn.__name__,
             int((time.monotonic() - started) * 1000),
         )
         return result
 
-    wrapped.__signature__ = inspect.signature(fn)
+    # eval_str: аннотации-строки (from __future__) вычисляем здесь, в globals
+    # модуля. Иначе FastMCP отдаёт строки pydantic, и тот ищет имена в своём
+    # модуле: Annotated/Any там есть случайно, а Literal — нет.
+    wrapped.__signature__ = inspect.signature(fn, eval_str=True)
     return mcp.tool()(wrapped)
 
 
@@ -121,6 +136,18 @@ def person_find(
     Зови ЭТО до обращения по ID — в крупной компании есть однофамильцы.
     """
     return api.person_find(_client(), query, limit=limit)
+
+
+# ------------------------------------------------------------------ согласования
+
+
+@b24_tool
+def approvals() -> list[dict[str, Any]]:
+    """Что ждёт моего решения: активные задания согласования (только чтение).
+
+    Нужен B24_USER_ID владельца вебхука. `url` — ссылка на документ задания.
+    """
+    return api.approvals(_client())
 
 
 # ------------------------------------------------------------------ календарь
@@ -152,16 +179,35 @@ def tasks_list(
     ] = "responsible",
     include_done: bool = False,
     limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    group_id: Annotated[int | None, Field(ge=1)] = None,
 ) -> dict[str, Any]:
-    """Задачи человека в выбранной роли.
+    """Задачи человека в выбранной роли или все задачи группы group_id.
+
+    При group_id user_id сужает список по ответственному; role — responsible.
 
     Дефолт `responsible` = «висит лично на нём». У руководителя почти все
     видимые задачи чужие (он постановщик/наблюдатель) — без роли список шумит.
     Поле `self_note` помечает «заметки сам себе» (постановщик = исполнитель).
     """
     return api.tasks_list(
-        _client(), user_id=user_id, role=role, include_done=include_done, limit=limit
+        _client(), user_id=user_id, group_id=group_id, role=role, include_done=include_done, limit=limit
     )
+
+
+@b24_tool
+def group_get(group_id: Annotated[int, Field(ge=1)]) -> dict[str, Any]:
+    """Карточка группы или проекта: имя, владелец, видимость."""
+    return api.group_get(_client(), group_id)
+
+
+@b24_tool
+def task_stages(group_id: Annotated[int, Field(ge=1)]) -> list[dict[str, Any]]:
+    """Колонки канбана группы по порядку; колонка не является статусом задачи.
+
+    На доске без стадий портал при первом вызове создаёт стадии по умолчанию;
+    tasks_list этот метод на такой доске не вызывает.
+    """
+    return api.group_stages(_client(), group_id)
 
 
 @b24_tool
@@ -274,28 +320,45 @@ def project_read(
 @b24_tool
 def followups_list(
     days: Annotated[int, Field(ge=1, le=90)] = 7,
-    user_id: Annotated[int | None, Field(ge=1, description="Только под админскими правами")] = None,
+    user_id: Annotated[
+        int | None, Field(ge=1, description="Только звонки Б24 и только под админскими правами")
+    ] = None,
     max_items: Annotated[int, Field(ge=1, le=100)] = 20,
+    source: Annotated[
+        Literal["all", "call", "sync"],
+        Field(description="all — звонки Б24 и встречи Синка; call — только Б24; sync — только Синк"),
+    ] = "all",
 ) -> dict[str, Any]:
-    """Завершённые звонки с ГОТОВЫМ AI-разбором за окно.
+    """Завершённые звонки с ГОТОВЫМ AI-разбором за окно: звонки Б24 и встречи Синка.
 
     Звонки без разбора портал не возвращает — пустой список это норма, а не сбой.
+    У каждой строки `source` — передай его в followup_get. `sources` говорит,
+    какой источник не ответил (например, нет скоупа syncconnector у вебхука).
     """
-    return api.followups_list(_client(), days=days, user_id=user_id, max_items=max_items)
+    return api.followups_list(
+        _client(), days=days, user_id=user_id, max_items=max_items, source=source
+    )
 
 
 @b24_tool
 def followup_get(
     call_id: Annotated[int, Field(ge=1)],
+    source: Annotated[
+        Literal["call", "sync"],
+        Field(description="`source` из строки followups_list: call — звонок Б24, sync — Синк"),
+    ],
     transcript: Annotated[bool, Field(description="Добавить полную расшифровку (тяжело)")] = False,
 ) -> dict[str, Any]:
-    """Разбор звонка: тема, повестка, договорённости, action items, участники.
+    """Разбор звонка или встречи Синка: тема, повестка, договорённости, action items, участники.
+
+    `source` обязателен: бери его из строки followups_list. Номера звонков Б24
+    и Синка могут совпадать: без верного `source` найдётся чужой звонок.
 
     ⚠️ `action_items` — СЫРЬЁ портала, а не готовый список твоих задач. Кому
     принадлежит задача, решай по говорящему и адресату: «ты сделай» → владелец
     адресат, «я сделаю» → владелец говорящий. Для этого бери `transcript=True`.
     """
-    return api.followup_get(_client(), call_id, transcript=transcript)
+    return api.followup_get(_client(), call_id, transcript=transcript, source=source)
 
 
 def _short(value: Any, limit: int = 300) -> str:
@@ -305,7 +368,7 @@ def _short(value: Any, limit: int = 300) -> str:
 
 def main() -> None:
     """Точка входа: `b24-mcp` или `python -m b24_mcp.server`."""
-    logger.info("b24-mcp: старт (read-only, %d инструментов)", 14)
+    logger.info("b24-mcp: старт (read-only, %d инструментов)", 17)
     mcp.run()
 
 

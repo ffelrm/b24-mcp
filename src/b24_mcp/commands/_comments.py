@@ -24,7 +24,7 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from ..client import B24Error, Client
+from ..client import B24Error, KIND_METHOD, Client
 
 # --- очистка BB-разметки сообщений ---
 _BB_QUOTE = re.compile(r"\[QUOTE\].*?\[/QUOTE\]", re.IGNORECASE | re.DOTALL)
@@ -34,8 +34,26 @@ _BB_URL_BARE = re.compile(r"\[URL\]([^\[]*)\[/URL\]", re.IGNORECASE)
 _BB_DISK = re.compile(r"\[DISK\s+FILE\s+ID=[^\]]+\](?:[^\[]*\[/DISK\])?", re.IGNORECASE)
 _BB_TS = re.compile(r"\[TIMESTAMP=[^\]]+\]", re.IGNORECASE)
 _BB_ANY = re.compile(r"\[/?[A-Za-z][^\]]*\]")
-# артефакт цитаты-ответа в чате: "----- Имя [дата] #chat123/456 ..."
-_QUOTE_ART = re.compile(r"-{6,}.*?#chat\d+/\d+", re.DOTALL)
+# Артефакт цитаты-ответа в чате. Реальная форма — блок из ТРЁХ частей:
+#   ------------------------------
+#   Имя Фамилия [дата] #chat123/456     <- шапка с якорем
+#   процитированный текст
+#   ------------------------------
+#   ответ автора                        <- это НЕ цитата, терять нельзя
+# Тело цитаты не может содержать строку-разделитель — на этом и держится
+# граница. Паттерн, закрывающийся на якоре, а не на закрывающем разделителе,
+# в треде из нескольких цитат начинал следующее совпадение с закрывающего
+# разделителя первой и съедал ответ между цитатами: оставался только текст
+# после последней цитаты.
+_SEP = r"^-{6,}[ \t]*$"
+_QUOTE_ART = re.compile(
+    r"^-{6,}[ \t]*\r?\n"                    # открывающий разделитель
+    r"(?:(?!" + _SEP + r").)*?"             # шапка, не перескакивая разделитель
+    r"#chat\d+/\d+"                         # якорь цитаты
+    r"(?:(?!" + _SEP + r").)*?"             # процитированный текст
+    r"\r?\n-{6,}[ \t]*$",                   # закрывающий разделитель
+    re.DOTALL | re.MULTILINE,
+)
 # описание задачи может прийти как HTML (а не BBCode) — чистим теги
 _HTML_TAG = re.compile(r"<[^>]+>")
 _HTML_BR = re.compile(r"(?i)<br\s*/?>|</p\s*>|</div\s*>")
@@ -60,7 +78,7 @@ _SYS_LINE = re.compile(
 
 def clean_bb(text: str, *, drop_quotes: bool = False) -> str:
     s = text or ""
-    s = _QUOTE_ART.sub("「цитата」", s)
+    s = _QUOTE_ART.sub("" if drop_quotes else "「цитата」", s)
     s = _BB_QUOTE.sub("" if drop_quotes else "「цитата」 ", s)
     s = re.sub(r"-{6,}", " — ", s)  # артефакт-разделитель цитаты
     s = _BB_USER.sub(r"@\1", s)
@@ -163,10 +181,13 @@ def fetch_task_results(client: Client, task_id: int) -> list[dict[str, Any]]:
     """
     try:
         res = client.call("tasks.task.result.list", {"taskId": int(task_id)})
-    except B24Error:
-        # Метода нет на портале / нет прав — это не отказ команды: у задачи
-        # просто не будет блока результатов.
-        return []
+    except B24Error as e:
+        # Метода нет на портале — это не отказ вызова: у задачи просто не будет
+        # блока результатов. Сеть, доступ и прочие фатальные отказы не гасим:
+        # пустой список после них выглядел бы как честное «результатов нет».
+        if e.kind == KIND_METHOD:
+            return []
+        raise
     if not isinstance(res, list):
         return []
     return [r for r in res if isinstance(r, dict)]

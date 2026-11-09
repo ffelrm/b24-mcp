@@ -26,10 +26,14 @@ EXPECTED_TOOLS = {
     "whoami",
     "person_find",
     "calendar_events",
-    # задачи
+    "approvals",
+    # задачи и группы
     "tasks_list",
+    "group_get",
+    "task_stages",
     "task_get",
     "task_chat",
+    # результаты задачи — отдельная сущность, в чате от неё только системный след
     "task_result",
     "tasks_updates",
     # чаты и проекты
@@ -79,6 +83,85 @@ async def test_every_tool_has_description():
 
     for tool in await mcp_server.mcp.list_tools():
         assert (tool.description or "").strip(), f"{tool.name} без описания"
+
+
+@pytest.mark.asyncio
+async def test_followups_source_is_an_enum_in_schema():
+    """`source` уходит в схему как перечень значений.
+
+    Пин починки обёртки: без eval_str в inspect.signature аннотации остаются
+    строками, и pydantic не находит `Literal` — инструмент не регистрируется.
+    """
+    from b24_mcp import server as mcp_server
+
+    tools = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    for name, values in [("followups_list", ["all", "call", "sync"]),
+                         ("followup_get", ["call", "sync"])]:
+        prop = tools[name].inputSchema["properties"]["source"]
+        assert prop.get("enum") == values, (name, prop)
+
+
+@pytest.mark.asyncio
+async def test_followup_get_requires_source_in_schema():
+    from b24_mcp import server as mcp_server
+
+    tools = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    schema = tools["followup_get"].inputSchema
+    assert schema["required"] == ["call_id", "source"]
+    assert "default" not in schema["properties"]["source"]
+    assert list(schema["properties"]) == ["call_id", "source", "transcript"]
+    assert tools["followups_list"].inputSchema["properties"]["source"]["default"] == "all"
+
+
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("rest_path", ["/rest/1/", "/rest/api/1/"])
+def test_tool_errors_redact_secrets_in_response_and_log(monkeypatch, caplog, structured, rest_path):
+    from b24_mcp import server as mcp_server
+
+    text = (f"https://portal.invalid{rest_path}WEBHOOK_SECRET/user.get.json"
+            "?auth=AUTH_SECRET&access_token=ACCESS_SECRET&refresh_token=REFRESH_SECRET"
+            " query: auth=BARE_SECRET")
+
+    def boom(_client):
+        if structured:
+            # Код ошибки тоже может содержать секрет; его пишут в warning.
+            raise B24Error("user.get", text, text)
+        try:
+            raise ValueError(text)
+        except ValueError as cause:
+            raise RuntimeError(text) from cause
+
+    monkeypatch.setattr(mcp_server, "_client", lambda: object())
+    monkeypatch.setattr(mcp_server.api, "whoami", boom)
+    with caplog.at_level("INFO", logger="b24-mcp"):
+        with pytest.raises(RuntimeError) as error:
+            mcp_server.whoami()
+    for secret in ["WEBHOOK_SECRET", "AUTH_SECRET", "ACCESS_SECRET", "REFRESH_SECRET", "BARE_SECRET"]:
+        assert secret not in str(error.value)
+        assert secret not in caplog.text
+    assert "<redacted>" in str(error.value) and "<redacted>" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    if not structured:
+        assert "Traceback" in caplog.text and "ValueError" in caplog.text
+
+
+def test_followup_get_passes_explicit_source(monkeypatch):
+    from unittest.mock import Mock
+    from b24_mcp import server as mcp_server
+
+    client = object()
+    target = Mock(return_value={"source": "sync"})
+    monkeypatch.setattr(mcp_server, "_client", lambda: client)
+    monkeypatch.setattr(mcp_server.api, "followup_get", target)
+    assert mcp_server.followup_get(7, "sync", True) == {"source": "sync"}
+    target.assert_called_once_with(client, 7, transcript=True, source="sync")
+
+
+def test_server_has_no_write_door():
+    """В фасаде нет пишущей фабрики: писать инструментам нечем."""
+    from b24_mcp import server as mcp_server
+
+    assert not hasattr(mcp_server, "_writer")
 
 
 def test_client_is_read_only(monkeypatch):
